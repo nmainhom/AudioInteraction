@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 from typing import List, Optional
@@ -15,9 +16,39 @@ from src.audiointeraction.utils import get_default_supported_precision
 
 
 SYSTEM_PROMPT = (
-    "You are a helpful assistant. When there is no user text, if the audio contains a question, "
-    "please answer it. If it is a sound effect, determine based on the sound whether help is needed."
+    "Listen to the audio and briefly describe the acoustic environment. "
+    "Mention background sounds, whether speech is clear, and whether there is an important warning sound."
 )
+
+
+class InferenceEngine:
+    """A reusable model instance for a local HTTP agent."""
+
+    def __init__(self, *, checkpoint_dir: str, seed: int = 1337, device: str = "cuda:0"):
+        if not checkpoint_dir:
+            raise RuntimeError("`checkpoint_dir` is empty.")
+        self.device = device
+        set_seed(seed)
+        self.fabric = L.Fabric(devices=1, num_nodes=1, strategy="auto",
+                               precision=get_default_supported_precision(training=False), loggers="tensorboard")
+        model_config_dir, trained_checkpoint, qwen_omni_ckpt, audio_tower_ckpt = resolve_checkpoint_paths(checkpoint_dir)
+        self.model = load_model(self.fabric, model_config_dir, trained_checkpoint).to(device)
+        self.audio_encoder = load_audio_encoder(qwen_omni_ckpt, audio_tower_ckpt, device)
+        self.tokenizer = Tokenizer(model_config_dir)
+        system_ids = self.tokenizer.encode(SYSTEM_PROMPT).cpu().tolist()
+        self.prefix_ids = torch.LongTensor([ONLINE, ENGLISH, SYSTEM, TEXT_BEGIN] + system_ids + [TEXT_END]).to(self.model.device)
+        self.model.eval()
+
+    def run(self, *, rounds: int = 10, audio_paths: Optional[List[str]] = None, max_new_tokens: int = 4096):
+        with self.fabric.init_tensor():
+            self.model.set_kv_cache(batch_size=1)
+        try:
+            with torch.inference_mode():
+                return streaming_generate(self.model, self.audio_encoder, self.tokenizer, self.prefix_ids,
+                                          rounds=rounds, audio_paths=audio_paths,
+                                          max_returned_tokens=max_new_tokens, temperature=0.0, top_p=0.0)
+        finally:
+            self.model.clear_kv_cache()
 
 
 def run_inference(
@@ -119,12 +150,75 @@ def load_audio_paths(input_path: str) -> List[str]:
     raise ValueError(f"Input not found: {input_path}")
 
 
-# A single audio file, or a folder (with a sequence.json, or just loose audio files).
-# Bundled samples, e.g. sample/01_count_bark, sample/02_translate, sample/03_cough_music
-input_path = "sample/01_count_bark"
-audio_paths = load_audio_paths(input_path)
+def parse_environment(reply_text: str) -> dict:
+    """Conservative, explainable tags for an external agent.
 
-run_inference(checkpoint_dir="./checkpoints",
-    audio_paths=audio_paths,
-    device=get_best_device(),
-)
+    These tags are derived from the model's natural-language answer; they are
+    not an independent audio classifier.  `analysis_valid=False` means the
+    model chose to remain silent or did not produce a complete answer.
+    """
+    text = reply_text.strip().lower()
+    if not text:
+        return {"noise_level": "unknown", "speech_clarity": "unknown", "sounds": [],
+                "important_event": False, "analysis_valid": False}
+
+    def contains(words):
+        return any(word in text for word in words)
+
+    if contains(["very noisy", "loud background", "heavy traffic", "extremely noisy", "significant background"]):
+        noise_level = "high"
+    elif contains(["quiet", "minimal background", "little background", "low background", "no significant background"]):
+        noise_level = "low"
+    else:
+        noise_level = "medium"
+
+    if contains(["speech is unclear", "voice is unclear", "difficult to understand", "hard to understand", "unintelligible"]):
+        speech_clarity = "low"
+    elif contains(["speech is clear", "voice is clear", "clearly audible", "clearly heard", "easy to understand"]):
+        speech_clarity = "high"
+    else:
+        speech_clarity = "medium"
+
+    sound_map = {
+        "traffic": ["traffic", "road traffic", "busy road", "busy street"],
+        "vehicle_passing": ["vehicle passing", "passing vehicle", "car passing", "cars passing"],
+        "engine": ["engine", "engine noise", "engine running", "engine revving"],
+        "siren": ["siren", "ambulance", "police siren", "fire truck"],
+        "rain": ["rain", "raining", "rainfall", "raindrops"],
+        "thunder": ["thunder", "thunderclap", "thunderstorm"],
+        "conversation": ["conversation", "people talking", "people speaking", "chatter"],
+        "crying": ["crying", "baby crying", "child crying", "infant crying"],
+        "music": ["music", "song playing", "radio music"],
+        "horn": ["horn", "honking"],
+        "alarm": ["alarm", "warning alarm"],
+        "beeping": ["beeping", "electronic beep"],
+    }
+    sounds = [tag for tag, keywords in sound_map.items() if contains(keywords)]
+    important_event = contains(["siren", "alarm", "warning", "crash", "collision", "emergency", "tire skid"])
+    return {"noise_level": noise_level, "speech_clarity": speech_clarity, "sounds": sounds,
+            "important_event": important_event, "analysis_valid": True}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run AudioInteraction on an audio file or sequence.")
+    parser.add_argument("--input", default="sample/01_count_bark", help="Audio file, sequence.json, or folder.")
+    parser.add_argument("--checkpoint-dir", default="./checkpoints")
+    parser.add_argument("--json", action="store_true", help="Print a final agent-friendly JSON result.")
+    args = parser.parse_args()
+
+    audio_paths = load_audio_paths(args.input)
+    run_inference(checkpoint_dir=args.checkpoint_dir, audio_paths=audio_paths, device=get_best_device())
+    reply_text = getattr(streaming_generate, "last_reply_text", "")
+    result = {"reply_text": reply_text, "environment": parse_environment(reply_text),
+              "input": [str(path) for path in audio_paths]}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print("\n===== AUDIOINTERACTION REPLY TEXT =====")
+        print(reply_text)
+        print("\n===== ENVIRONMENT JSON =====")
+        print(json.dumps(result["environment"], ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

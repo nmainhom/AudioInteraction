@@ -2,6 +2,7 @@ PyQt6
 sounddevice
 flask_socketio
 flask
+lightning
 pydub
 librosa
 openai-whisper

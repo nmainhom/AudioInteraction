@@ -280,6 +280,9 @@ def streaming_generate(
     input_pos_maxp1 = _init_input_pos_maxp1(model, prefix_ids.size(0), device)
 
     turns: List[List[int]] = []  # one inner list per assistant turn (across all rounds)
+    # Keep a machine-readable copy as well as streaming text printed by _Pretty.
+    # Consumers such as an agent should not have to scrape ANSI terminal output.
+    reply_texts: List[str] = []
 
     if audio_paths is not None:
         steps = []
@@ -372,6 +375,12 @@ def streaming_generate(
                 if int_token == TEXT_END:
                     if text_started:
                         ui.reply_end()
+                    # Decode a completed turn in one operation.  Decoding each BPE
+                    # token independently can corrupt multi-byte characters.
+                    text_ids = current_turn[1:-1]
+                    if text_ids and text_ids[0] in EMOTION_KAOMOJI:
+                        text_ids = text_ids[1:]
+                    reply_texts.append(tokenizer.decode(torch.tensor(text_ids)).strip())
                     turns.append(current_turn)
                     current_turn = []
                     text_started = False
@@ -410,4 +419,8 @@ def streaming_generate(
             ui.round_summary(acc_replied, acc_silent, acc_replied + acc_silent)
 
     ui.finish()
+    # Backwards-compatible lightweight result channel for callers that still
+    # consume `turns`.  Empty entries are intentional (an emotion-only reply).
+    streaming_generate.last_reply_texts = reply_texts
+    streaming_generate.last_reply_text = reply_texts[-1] if reply_texts else ""
     return turns
